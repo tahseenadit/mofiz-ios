@@ -56,7 +56,11 @@ class APIService: ObservableObject {
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var speechDelegate: SpeechDelegate?
     
-    init() {
+    // Database service
+    private let databaseService: DatabaseService
+    
+    init(databaseService: DatabaseService = DatabaseService()) {
+        self.databaseService = databaseService
         checkAvailableVoices()
     }
     
@@ -79,7 +83,7 @@ class APIService: ObservableObject {
         }
     }
     
-    func sendCommand(_ command: String) {
+    func sendCommand(_ command: String, isInterruption: Bool = false) {
         // Store the command being sent
         lastSentCommand = command
         isLoading = true
@@ -89,17 +93,26 @@ class APIService: ObservableObject {
         
         // Log to console for debugging
         print("📤 Sending command to Worker: \(command)")
+        if isInterruption {
+            print("⚠️ This is an interruption - will include conversation history")
+        }
         print("🌐 Worker URL: \(workerURL)")
         
         // Use async/await for cleaner code
         Task {
             do {
-                let response = try await askViaWorker(prompt: command)
+                // Get conversation context with exponential backoff
+                let contextPrompt = await buildContextPrompt(userMessage: command, isInterruption: isInterruption)
+                
+                let response = try await askViaWorker(prompt: contextPrompt)
                 await MainActor.run {
                     self.isLoading = false
                     self.lastResponse = response
                     self.statusMessage = "Response received"
                     print("✅ Response received: \(response)")
+                    
+                    // Save to database (save the user's command, not the full context)
+                    self.saveChatToDatabase(message: command, response: response)
                     
                     // Convert response to speech and play it
                     self.speakText(response)
@@ -245,14 +258,20 @@ class APIService: ObservableObject {
             speechSynthesizer.stopSpeaking(at: .immediate)
         }
         
-        // Configure audio session for playback
+        // Configure audio session for playback with mixing support
+        // This allows simultaneous recording during playback
         do {
             let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
-            try audioSession.setActive(true)
+            // Use .playAndRecord to allow simultaneous recording
+            // Use .mixWithOthers to allow mixing with other audio
+            // Use .defaultToSpeaker to ensure audio plays through speaker
+            try audioSession.setCategory(.playAndRecord, mode: .spokenAudio, options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
+            // Activate without deactivating first - this is safe with .mixWithOthers
+            try audioSession.setActive(true, options: [])
+            print("✅ Audio session configured for TTS with recording support")
         } catch {
-            print("❌ Error setting up audio session for speech: \(error)")
-            return
+            print("❌ Error setting up audio session for speech: \(error.localizedDescription)")
+            // Continue anyway - might still work
         }
         
         // Create speech utterance
@@ -322,6 +341,14 @@ class APIService: ObservableObject {
         isSpeaking = true
         speechSynthesizer.speak(utterance)
         print("🔊 Speaking response (\(isBengali ? "Bengali" : "English")): \(text.prefix(50))...")
+        
+        // Notify that we're starting to speak (so UI can start listening for interruptions)
+        // Include timestamp in notification for debouncing
+        NotificationCenter.default.post(
+            name: NSNotification.Name("SpeechStarted"), 
+            object: nil,
+            userInfo: ["timestamp": Date()]
+        )
     }
     
     func stopSpeaking() {
@@ -329,15 +356,145 @@ class APIService: ObservableObject {
             speechSynthesizer.stopSpeaking(at: .immediate)
             isSpeaking = false
             
-            // Deactivate audio session properly
-            do {
-                let audioSession = AVAudioSession.sharedInstance()
-                try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-            } catch {
-                print("⚠️ Error deactivating audio session after stopping speech: \(error)")
-                // Don't throw - this is not critical
+            // Don't deactivate audio session - speech recognition might be using it
+            // The session will be managed by SpeechRecognitionManager
+            print("🔇 Stopped speaking - audio session remains active for recording")
+        }
+    }
+    
+    // MARK: - Conversation Context Management
+    
+    /// Build context prompt with conversation history using exponential backoff
+    private func buildContextPrompt(userMessage: String, isInterruption: Bool) async -> String {
+        let user = databaseService.getOrCreateCurrentUser()
+        guard let userId = user.id else {
+            return userMessage // No user, just return the message
+        }
+        
+        // Get active thread
+        let activeThread = databaseService.getOrCreateActiveThread(for: userId)
+        guard let threadId = activeThread.id else {
+            return userMessage // No thread, just return the message
+        }
+        
+        // Get conversation history from this thread
+        let chatHistory = databaseService.getChatHistory(forThreadId: threadId)
+        
+        // If no history, just return the message
+        if chatHistory.isEmpty {
+            return userMessage
+        }
+        
+        // For interruptions, always include context. For regular messages, include if there's history
+        if !isInterruption && chatHistory.count == 0 {
+            return userMessage
+        }
+        
+        // Exponential backoff: include fewer messages as we go back
+        // Start with most recent messages and include fewer as we go back
+        var contextMessages: [(message: String, response: String)] = []
+        var totalLength = userMessage.count
+        let maxContextLength = 2000 // Approximate token limit consideration
+        
+        // Start from most recent and work backwards with exponential backoff
+        var includeCount = min(5, chatHistory.count) // Start with last 5 messages
+        var startIndex = max(0, chatHistory.count - includeCount)
+        
+        while startIndex < chatHistory.count && totalLength < maxContextLength {
+            let chat = chatHistory[startIndex]
+            if let message = chat.message, let response = chat.response {
+                let combinedLength = message.count + response.count
+                if totalLength + combinedLength > maxContextLength {
+                    break // Stop if adding this would exceed limit
+                }
+                contextMessages.insert((message: message, response: response), at: 0)
+                totalLength += combinedLength
+            }
+            startIndex += 1
+            
+            // Exponential backoff: reduce how many we include as we go back
+            if startIndex >= chatHistory.count {
+                break
+            }
+            // For older messages, include fewer (every 2nd, then every 4th, etc.)
+            if startIndex > chatHistory.count - 5 {
+                // First 5: include all
+            } else if startIndex > chatHistory.count - 10 {
+                // Next 5: include every 2nd
+                if (chatHistory.count - startIndex) % 2 != 0 {
+                    startIndex += 1
+                    continue
+                }
+            } else {
+                // Older: include every 4th
+                if (chatHistory.count - startIndex) % 4 != 0 {
+                    startIndex += 1
+                    continue
+                }
             }
         }
+        
+        // Build context string
+        var contextString = ""
+        for (index, chat) in contextMessages.enumerated() {
+            contextString += "Previous conversation \(contextMessages.count - index):\n"
+            contextString += "User: \(chat.message)\n"
+            contextString += "Assistant: \(chat.response)\n\n"
+        }
+        
+        // Combine context with new message
+        if !contextString.isEmpty {
+            let fullPrompt = """
+            \(contextString)Current conversation:
+            User: \(userMessage)
+            Assistant:
+            """
+            print("📝 Built context with \(contextMessages.count) previous messages")
+            return fullPrompt
+        }
+        
+        return userMessage
+    }
+    
+    // MARK: - Database Operations
+    
+    /// Save chat conversation to database
+    private func saveChatToDatabase(message: String, response: String) {
+        // Get or create current user
+        let user = databaseService.getOrCreateCurrentUser()
+        guard let userId = user.id else {
+            print("❌ User ID is nil, cannot save chat history")
+            return
+        }
+        
+        // Detect language
+        let language = containsBengali(message) || containsBengali(response) ? "bn" : "en"
+        
+        // Create metadata
+        let metadata: [String: Any] = [
+            "model": "gpt-4o-mini",
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "messageLength": message.count,
+            "responseLength": response.count
+        ]
+        
+        // Save to database
+        databaseService.saveChatHistory(
+            userId: userId,
+            message: message,
+            response: response,
+            language: language,
+            metadata: metadata
+        )
+    }
+    
+    /// Create a new chat thread
+    func createNewThread() {
+        let user = databaseService.getOrCreateCurrentUser()
+        guard let userId = user.id else { return }
+        
+        databaseService.createNewThread(for: userId, title: nil)
+        print("✅ Created new thread")
     }
 }
 
