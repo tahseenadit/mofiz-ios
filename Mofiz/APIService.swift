@@ -265,11 +265,16 @@ class APIService: ObservableObject {
             let audioSession = AVAudioSession.sharedInstance()
             // Use .playAndRecord to allow simultaneous recording
             // Use .mixWithOthers to allow mixing with other audio
-            // Use .defaultToSpeaker to ensure audio plays through speaker
-            try audioSession.setCategory(.playAndRecord, mode: .spokenAudio, options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
+            // DON'T use .defaultToSpeaker - without it, defaults to earpiece/receiver to avoid feedback
+            // This prevents microphone from picking up TTS audio from speaker
+            try audioSession.setCategory(.playAndRecord, mode: .spokenAudio, options: [.allowBluetooth, .mixWithOthers])
+            
+            // Without .defaultToSpeaker, audio will play through earpiece/receiver by default
+            // This prevents feedback loop where microphone picks up speaker audio
+            
             // Activate without deactivating first - this is safe with .mixWithOthers
             try audioSession.setActive(true, options: [])
-            print("✅ Audio session configured for TTS with recording support")
+            print("✅ Audio session configured for TTS with earpiece output (to avoid feedback)")
         } catch {
             print("❌ Error setting up audio session for speech: \(error.localizedDescription)")
             // Continue anyway - might still work
@@ -336,6 +341,14 @@ class APIService: ObservableObject {
                     print("✅ Finished speaking response")
                     // Only notify if we actually finished naturally (not interrupted)
                     if !(self?.isInterrupting ?? false) {
+                        // Speech finished naturally - switch back to speaker
+                        do {
+                            let audioSession = AVAudioSession.sharedInstance()
+                            try audioSession.overrideOutputAudioPort(.speaker)
+                            print("🔊 Switched audio output back to speaker after TTS finished")
+                        } catch {
+                            print("⚠️ Could not switch audio output: \(error)")
+                        }
                         // Speech finished naturally - notify
                         NotificationCenter.default.post(name: NSNotification.Name("SpeechFinished"), object: nil)
                     } else {
@@ -370,6 +383,15 @@ class APIService: ObservableObject {
             // Stop speaking
             speechSynthesizer.stopSpeaking(at: .immediate)
             isSpeaking = false
+            
+            // Switch back to speaker for normal listening (when not during playback)
+            do {
+                let audioSession = AVAudioSession.sharedInstance()
+                try audioSession.overrideOutputAudioPort(.speaker)
+                print("🔇 Switched audio output back to speaker after interruption")
+            } catch {
+                print("⚠️ Could not switch audio output: \(error)")
+            }
             
             // Don't deactivate audio session - speech recognition might be using it
             // The session will be managed by SpeechRecognitionManager

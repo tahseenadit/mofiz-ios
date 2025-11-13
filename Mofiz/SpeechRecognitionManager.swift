@@ -104,12 +104,14 @@ class SpeechRecognitionManager: NSObject, ObservableObject {
                 let currentCategory = audioSession.category
                 if currentCategory != .playAndRecord {
                     // Reconfigure to playAndRecord if not already set
+                    // DON'T use .defaultToSpeaker - without it, defaults to earpiece to avoid feedback
                     print("🔄 Reconfiguring audio session to .playAndRecord for simultaneous recording")
-                    try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
+                    try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.allowBluetooth, .mixWithOthers])
+                    // Without .defaultToSpeaker, audio will use earpiece by default (avoids feedback)
                 }
                 // Activate without deactivating first - this is safe with .mixWithOthers
                 try audioSession.setActive(true, options: [])
-                print("✅ Audio session activated for recording during playback")
+                print("✅ Audio session activated for recording during playback (earpiece output)")
             } else {
                 // Normal recording mode - safe to deactivate first
                 // Check if other audio is playing before deactivating
