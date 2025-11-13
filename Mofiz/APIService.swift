@@ -269,12 +269,13 @@ class APIService: ObservableObject {
             // This prevents microphone from picking up TTS audio from speaker
             try audioSession.setCategory(.playAndRecord, mode: .spokenAudio, options: [.allowBluetooth, .mixWithOthers])
             
-            // Without .defaultToSpeaker, audio will play through earpiece/receiver by default
-            // This prevents feedback loop where microphone picks up speaker audio
-            
             // Activate without deactivating first - this is safe with .mixWithOthers
             try audioSession.setActive(true, options: [])
-            print("✅ Audio session configured for TTS with earpiece output (to avoid feedback)")
+            
+            // EXPLICITLY force earpiece output to prevent any possibility of speaker output
+            // This ensures TTS audio goes to earpiece/receiver, not speaker, to avoid feedback
+            try audioSession.overrideOutputAudioPort(.none)
+            print("✅ Audio session configured for TTS with EXPLICIT earpiece output (to avoid feedback)")
         } catch {
             print("❌ Error setting up audio session for speech: \(error.localizedDescription)")
             // Continue anyway - might still work

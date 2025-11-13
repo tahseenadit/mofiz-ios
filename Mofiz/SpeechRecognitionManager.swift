@@ -24,7 +24,7 @@ class SpeechRecognitionManager: NSObject, ObservableObject {
     
     // Interruption detection state
     private var lastInterruptionAttempt: Date?
-    private var interruptionDebounceInterval: TimeInterval = 0.5 // Increased to prevent rapid false triggers
+    private var interruptionDebounceInterval: TimeInterval = 1.0 // Increased to 1.0s to prevent rapid false triggers
     private var ttsStartTime: Date? // Track when TTS started to prevent immediate false triggers
     
     var onCommandRecognized: ((String) -> Void)?
@@ -111,7 +111,11 @@ class SpeechRecognitionManager: NSObject, ObservableObject {
                 }
                 // Activate without deactivating first - this is safe with .mixWithOthers
                 try audioSession.setActive(true, options: [])
-                print("✅ Audio session activated for recording during playback (earpiece output)")
+                
+                // EXPLICITLY ensure earpiece output is maintained (don't let it switch to speaker)
+                // This prevents any possibility of TTS audio going to speaker and causing feedback
+                try audioSession.overrideOutputAudioPort(.none)
+                print("✅ Audio session activated for recording during playback (EXPLICIT earpiece output maintained)")
             } else {
                 // Normal recording mode - safe to deactivate first
                 // Check if other audio is playing before deactivating
@@ -238,19 +242,11 @@ class SpeechRecognitionManager: NSObject, ObservableObject {
                             // Only consider it noise if it's a single noise word
                             let isLikelyNoise = words.count == 1 && words.allSatisfy { noisePatterns.contains($0) }
                             
-                            // Additional check: if text is very short and matches common TTS patterns
-                            // TTS often gets recognized as single words or very short phrases
-                            let isVeryShort = trimmedText.count < 8 && words.count <= 2
-                            let isLikelyTTSFeedback = isVeryShort && words.allSatisfy { word in
-                                // Common words that TTS might be recognized as
-                                noisePatterns.contains(word) || word.count <= 3
-                            }
-                            
                             // Debounce: prevent rapid false triggers
                             let now = Date()
                             if let lastAttempt = self.lastInterruptionAttempt {
                                 let timeSinceLastAttempt = now.timeIntervalSince(lastAttempt)
-                                if timeSinceLastAttempt < 0.5 { // Increased to 0.5s to prevent rapid false triggers
+                                if timeSinceLastAttempt < self.interruptionDebounceInterval {
                                     print("⏸️ Interruption debounced (last attempt \(String(format: "%.2f", timeSinceLastAttempt))s ago)")
                                     return // Skip this interruption attempt
                                 }
@@ -259,24 +255,38 @@ class SpeechRecognitionManager: NSObject, ObservableObject {
                             // Prevent interruptions too soon after TTS starts (longer delay to avoid TTS feedback)
                             if let ttsStart = self.ttsStartTime {
                                 let timeSinceTTSStart = now.timeIntervalSince(ttsStart)
-                                if timeSinceTTSStart < 1.0 { // Increased to 1.0s to avoid TTS feedback
+                                if timeSinceTTSStart < 2.0 { // Increased to 2.0s to avoid TTS feedback
                                     print("⏸️ Too soon after TTS start (\(String(format: "%.2f", timeSinceTTSStart))s), ignoring potential TTS feedback")
                                     return
                                 }
                             }
                             
-                            // Requirements for interruption (stricter thresholds to avoid TTS feedback):
-                            // Need at least 2 words with 8+ chars total OR 1 word with 7+ chars
-                            // Must not be just noise patterns or TTS feedback
-                            let hasMinimumLength = trimmedText.count >= 7 // Increased from 5 to 7
-                            let hasAtLeastOneWord = words.count >= 1
+                            // Balanced Requirements for interruption to avoid TTS feedback but allow real interruptions:
+                            // 1. Must have at least 2 words (TTS feedback is usually 1 word)
+                            // 2. Must have reasonable length (8+ chars for 2 words, 12+ for partial results)
+                            // 3. Prefer final results, but allow partial if long enough
+                            // 4. Must not be noise patterns or TTS feedback
+                            let hasMinimumLength = trimmedText.count >= 8 // Lowered from 15 to 8 for responsiveness
+                            let hasAtLeastTwoWords = words.count >= 2 // Require 2+ words (TTS feedback is usually 1 word)
                             let hasMultipleWords = words.count >= 2
-                            let hasMultipleWordsWithLength = hasMultipleWords && trimmedText.count >= 8
+                            let hasMultipleWordsWithLength = hasMultipleWords && trimmedText.count >= 8 // Lowered from 20 to 8
+                            
+                            let isFinalResult = result.isFinal
+                            
+                            // Enhanced TTS feedback detection - filter out very short single words
+                            // TTS feedback is usually: 1 word, < 8 chars, or very short partial results
+                            let isLikelyTTSFeedback = (words.count < 2) || (trimmedText.count < 8) || (!isFinalResult && trimmedText.count < 12)
+                            
                             let isNotNoise = !isLikelyNoise && !isLikelyTTSFeedback
                             
-                            // Interrupt if: (2+ words with 8+ chars) OR (1 word with 7+ chars and not noise/TTS)
-                            // This prevents false triggers from TTS feedback and single short words
-                            let shouldInterrupt = (hasMultipleWordsWithLength || (hasMinimumLength && hasAtLeastOneWord)) && isNotNoise
+                            // Interrupt if:
+                            // - 2+ words with 8+ chars (final result) OR
+                            // - 2+ words with 12+ chars (partial result - longer to be safe)
+                            // - AND not noise/TTS feedback
+                            let shouldInterrupt = (
+                                (hasAtLeastTwoWords && hasMinimumLength && isFinalResult) || // 2+ words, 8+ chars, final
+                                (hasMultipleWords && trimmedText.count >= 12 && !isFinalResult) // 2+ words, 12+ chars, partial
+                            ) && isNotNoise
                             
                             if shouldInterrupt {
                                 // User is speaking during playback - but only stop if we have visible text
@@ -286,8 +296,9 @@ class SpeechRecognitionManager: NSObject, ObservableObject {
                                 
                                 // Double-check that the text we're about to use for interruption is actually visible
                                 // This ensures the UI has had a chance to display it
+                                // Require reasonable visible text to prevent false interruptions
                                 let currentVisibleText = self.recognizedText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                let hasVisibleText = !currentVisibleText.isEmpty && currentVisibleText.count >= 3
+                                let hasVisibleText = !currentVisibleText.isEmpty && currentVisibleText.count >= 8 // Lowered from 15 to 8 for responsiveness
                                 
                                 if hasVisibleText {
                                     // We have visible text in the input field - safe to stop playback

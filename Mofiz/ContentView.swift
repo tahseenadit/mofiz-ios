@@ -13,6 +13,11 @@ struct ContentView: View {
     @StateObject private var databaseService = DatabaseService()
     @State private var messages: [ChatMessage] = []
     @State private var currentRecognizingText: String = ""
+    @State private var autoSendTimer: Timer?
+    @State private var lastRecognizedText: String = ""
+    @State private var shouldAutoSend: Bool = false
+    @State private var countdownSeconds: Int? = nil // nil = no countdown, 4-1 = countdown active
+    @State private var countdownStartTime: Date? = nil
     
     var body: some View {
         VStack(spacing: 0) {
@@ -111,13 +116,23 @@ struct ContentView: View {
                                 .cornerRadius(20)
                         } else if !currentRecognizingText.isEmpty {
                             // Show recognized text (keep visible even after interruption)
-                            Text(currentRecognizingText)
-                                .font(.body)
-                                .foregroundColor(.secondary)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .background(Color.gray.opacity(0.1))
-                                .cornerRadius(20)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(currentRecognizingText)
+                                    .font(.body)
+                                    .foregroundColor(.secondary)
+                                
+                                // Show countdown if active
+                                if let countdown = countdownSeconds, countdown > 0 {
+                                    Text("Auto sending in \(countdown)... speak to prevent auto sending")
+                                        .font(.caption)
+                                        .foregroundColor(.orange)
+                                        .italic()
+                                }
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(Color.gray.opacity(0.1))
+                            .cornerRadius(20)
                         }
                         Spacer()
                         // Show send button when we have text (even if not actively listening)
@@ -214,6 +229,28 @@ struct ContentView: View {
         .onChange(of: speechManager.recognizedText) { newText in
             // Update current recognizing text in real-time
             currentRecognizingText = newText
+            
+            // Auto-send logic: if text changed, reset timer; if no change for 4 seconds, auto-send
+            if !newText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // Text exists - check if it's new or same
+                if newText != lastRecognizedText {
+                    // New text detected - reset timer
+                    lastRecognizedText = newText
+                    resetAutoSendTimer()
+                }
+                // If text is same, timer will continue (or start if first time)
+                startAutoSendTimer()
+            } else {
+                // Text is empty - cancel timer
+                cancelAutoSendTimer()
+                lastRecognizedText = ""
+            }
+        }
+        .onChange(of: shouldAutoSend) { shouldSend in
+            if shouldSend {
+                shouldAutoSend = false
+                sendCurrentText()
+            }
         }
         .onChange(of: apiService.lastSentCommand) { command in
             if let command = command, !command.isEmpty {
@@ -223,6 +260,8 @@ struct ContentView: View {
                     addMessage(text: command, isUser: true)
                 }
                 currentRecognizingText = ""
+                lastRecognizedText = ""
+                cancelAutoSendTimer() // Cancel timer when message is sent
             }
         }
         .onChange(of: apiService.lastResponse) { response in
@@ -251,6 +290,8 @@ struct ContentView: View {
                 // Clear previous response and recognized text
                 speechManager.recognizedText = ""
                 currentRecognizingText = ""
+                lastRecognizedText = ""
+                cancelAutoSendTimer() // Cancel timer when TTS finishes
                 apiService.lastResponse = nil
                 apiService.lastSentCommand = nil
                 apiService.errorMessage = nil
@@ -279,6 +320,7 @@ struct ContentView: View {
         }
         .onDisappear {
             speechManager.stopListening()
+            cancelAutoSendTimer()
         }
     }
     
@@ -297,6 +339,9 @@ struct ContentView: View {
     private func sendCurrentText() {
         let textToSend = currentRecognizingText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !textToSend.isEmpty {
+            // Cancel auto-send timer since we're sending manually
+            cancelAutoSendTimer()
+            
             // Stop TTS if playing
             if apiService.isSpeaking {
                 apiService.stopSpeaking()
@@ -331,6 +376,7 @@ struct ContentView: View {
             }
             
             currentRecognizingText = ""
+            lastRecognizedText = ""
         }
     }
     
@@ -338,7 +384,67 @@ struct ContentView: View {
         apiService.createNewThread()
         messages.removeAll()
         currentRecognizingText = ""
+        lastRecognizedText = ""
+        cancelAutoSendTimer()
         speechManager.clearAndStartAgain()
+    }
+    
+    // MARK: - Auto-Send Timer Management
+    
+    private func startAutoSendTimer() {
+        // Cancel existing timer
+        cancelAutoSendTimer()
+        
+        // Reset countdown
+        countdownStartTime = Date()
+        countdownSeconds = 4
+        
+        // Start countdown timer that updates every second
+        autoSendTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak speechManager] timer in
+            guard let speechManager = speechManager else {
+                timer.invalidate()
+                return
+            }
+            
+            // Calculate seconds remaining based on start time
+            DispatchQueue.main.async {
+                guard let startTime = self.countdownStartTime else {
+                    timer.invalidate()
+                    return
+                }
+                
+                let elapsed = Date().timeIntervalSince(startTime)
+                let remaining = max(0, 4 - Int(elapsed))
+                
+                if remaining > 0 {
+                    self.countdownSeconds = remaining
+                } else {
+                    // Countdown finished - auto-send
+                    self.countdownSeconds = nil
+                    timer.invalidate()
+                    
+                    // Check if we still have text
+                    let currentText = speechManager.recognizedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !currentText.isEmpty {
+                        print("⏰ Auto-sending after 4 seconds of no new words")
+                        self.shouldAutoSend = true
+                    }
+                }
+            }
+        }
+    }
+    
+    private func resetAutoSendTimer() {
+        // Cancel and restart timer
+        cancelAutoSendTimer()
+        startAutoSendTimer()
+    }
+    
+    private func cancelAutoSendTimer() {
+        autoSendTimer?.invalidate()
+        autoSendTimer = nil
+        countdownSeconds = nil // Clear countdown when timer is cancelled
+        countdownStartTime = nil
     }
 }
 
