@@ -403,7 +403,8 @@ class APIService: ObservableObject {
     
     // MARK: - Conversation Context Management
     
-    /// Build context prompt with conversation history using exponential backoff
+    /// Build context prompt with conversation history using intelligent selection
+    /// Uses a sliding window approach with prioritization of recent messages
     private func buildContextPrompt(userMessage: String, isInterruption: Bool) async -> String {
         let user = databaseService.getOrCreateCurrentUser()
         guard let userId = user.id else {
@@ -424,75 +425,142 @@ class APIService: ObservableObject {
             return userMessage
         }
         
-        // For interruptions, always include context. For regular messages, include if there's history
-        if !isInterruption && chatHistory.count == 0 {
-            return userMessage
-        }
+        // Always include context if there's history (for both interruptions and regular messages)
+        // This helps AI maintain conversation continuity
         
-        // Exponential backoff: include fewer messages as we go back
-        // Start with most recent messages and include fewer as we go back
-        var contextMessages: [(message: String, response: String)] = []
+        // Estimate tokens: roughly 1 token ≈ 4 characters for English
+        // Reserve space for: system prompt, formatting, and response
+        // Target: ~3000-4000 tokens total, so context can use ~2000-3000 tokens
+        // That's roughly 8000-12000 characters for context
+        let maxContextChars = 10000 // ~2500 tokens for context
         var totalLength = userMessage.count
-        let maxContextLength = 2000 // Approximate token limit consideration
+        var contextMessages: [(message: String, response: String, index: Int)] = []
         
-        // Start from most recent and work backwards with exponential backoff
-        var includeCount = min(5, chatHistory.count) // Start with last 5 messages
-        var startIndex = max(0, chatHistory.count - includeCount)
+        // Strategy: Include recent messages fully, then use exponential backoff for older ones
+        // Recent messages (last 10): Include all
+        // Medium recent (11-20): Include every 2nd
+        // Older (21+): Include every 4th, then every 8th
         
-        while startIndex < chatHistory.count && totalLength < maxContextLength {
-            let chat = chatHistory[startIndex]
+        let recentCount = min(10, chatHistory.count)
+        let mediumCount = min(10, max(0, chatHistory.count - 10))
+        let olderCount = max(0, chatHistory.count - 20)
+        
+        // Process from most recent to oldest
+        
+        // 1. Include all recent messages (last 10)
+        let recentStart = max(0, chatHistory.count - recentCount)
+        for i in recentStart..<chatHistory.count {
+            let chat = chatHistory[i]
             if let message = chat.message, let response = chat.response {
-                let combinedLength = message.count + response.count
-                if totalLength + combinedLength > maxContextLength {
-                    break // Stop if adding this would exceed limit
+                let msgLength = message.count + response.count + 50 // +50 for formatting
+                if totalLength + msgLength > maxContextChars {
+                    break
                 }
-                contextMessages.insert((message: message, response: response), at: 0)
-                totalLength += combinedLength
+                contextMessages.append((message: message, response: response, index: i))
+                totalLength += msgLength
             }
-            startIndex += 1
-            
-            // Exponential backoff: reduce how many we include as we go back
-            if startIndex >= chatHistory.count {
-                break
-            }
-            // For older messages, include fewer (every 2nd, then every 4th, etc.)
-            if startIndex > chatHistory.count - 5 {
-                // First 5: include all
-            } else if startIndex > chatHistory.count - 10 {
-                // Next 5: include every 2nd
-                if (chatHistory.count - startIndex) % 2 != 0 {
-                    startIndex += 1
-                    continue
-                }
-            } else {
-                // Older: include every 4th
-                if (chatHistory.count - startIndex) % 4 != 0 {
-                    startIndex += 1
-                    continue
+        }
+        
+        // 2. Include medium recent messages (every 2nd, from 11-20)
+        if totalLength < maxContextChars {
+            let mediumStart = max(0, chatHistory.count - recentCount - mediumCount)
+            let mediumEnd = chatHistory.count - recentCount
+            if mediumEnd > mediumStart {
+                for i in stride(from: mediumStart, to: mediumEnd, by: 2) {
+                    let chat = chatHistory[i]
+                    if let message = chat.message, let response = chat.response {
+                        let msgLength = message.count + response.count + 50
+                        if totalLength + msgLength > maxContextChars {
+                            break
+                        }
+                        contextMessages.append((message: message, response: response, index: i))
+                        totalLength += msgLength
+                    }
                 }
             }
         }
         
-        // Build context string
+        // 3. Include older messages with exponential backoff (every 4th, then every 8th)
+        if totalLength < maxContextChars {
+            let olderStart = max(0, chatHistory.count - recentCount - mediumCount - olderCount)
+            let olderEnd = chatHistory.count - recentCount - mediumCount
+            if olderEnd > olderStart {
+                // First pass: every 4th message
+                var addedInThisPass = false
+                for i in stride(from: olderStart, to: olderEnd, by: 4) {
+                    let chat = chatHistory[i]
+                    if let message = chat.message, let response = chat.response {
+                        let msgLength = message.count + response.count + 50
+                        if totalLength + msgLength > maxContextChars {
+                            break
+                        }
+                        contextMessages.append((message: message, response: response, index: i))
+                        totalLength += msgLength
+                        addedInThisPass = true
+                    }
+                }
+                
+                // Second pass: if we have space, try every 8th for even older messages
+                if addedInThisPass && totalLength < maxContextChars {
+                    for i in stride(from: olderStart, to: olderEnd, by: 8) {
+                        // Skip if already added in first pass (when i % 4 == 0)
+                        if i % 4 == 0 {
+                            continue
+                        }
+                        let chat = chatHistory[i]
+                        if let message = chat.message, let response = chat.response {
+                            let msgLength = message.count + response.count + 50
+                            if totalLength + msgLength > maxContextChars {
+                                break
+                            }
+                            contextMessages.append((message: message, response: response, index: i))
+                            totalLength += msgLength
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Sort by index to maintain chronological order
+        contextMessages.sort { $0.index < $1.index }
+        
+        // Build well-formatted context string
         var contextString = ""
-        for (index, chat) in contextMessages.enumerated() {
-            contextString += "Previous conversation \(contextMessages.count - index):\n"
-            contextString += "User: \(chat.message)\n"
-            contextString += "Assistant: \(chat.response)\n\n"
+        if !contextMessages.isEmpty {
+            contextString += "## Conversation History\n\n"
+            contextString += "Here is the conversation history for context:\n\n"
+            
+            for (idx, chat) in contextMessages.enumerated() {
+                let turnNumber = idx + 1
+                contextString += "### Turn \(turnNumber)\n"
+                contextString += "**User:** \(chat.message)\n"
+                contextString += "**Assistant:** \(chat.response)\n\n"
+            }
+            
+            contextString += "---\n\n"
         }
         
-        // Combine context with new message
+        // Build the full prompt with clear instructions
+        // Format optimized for GPT models to understand context better
+        let fullPrompt: String
         if !contextString.isEmpty {
-            let fullPrompt = """
-            \(contextString)Current conversation:
-            User: \(userMessage)
-            Assistant:
+            fullPrompt = """
+            \(contextString)## Current Request
+            
+            **User:** \(userMessage)
+            
+            **Assistant:** Please provide a helpful, contextual response based on the conversation history above. If the user is continuing a previous topic, reference it naturally. Keep your response concise but complete.
             """
-            print("📝 Built context with \(contextMessages.count) previous messages")
-            return fullPrompt
+        } else {
+            // Fallback if no context (shouldn't happen, but just in case)
+            fullPrompt = userMessage
         }
         
-        return userMessage
+        let estimatedTokens = totalLength / 4
+        print("📝 Built context with \(contextMessages.count) previous messages (~\(estimatedTokens) tokens)")
+        print("📝 Context covers \(contextMessages.count) out of \(chatHistory.count) total messages in thread")
+        
+        return fullPrompt
     }
     
     // MARK: - Database Operations
