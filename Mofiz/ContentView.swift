@@ -93,18 +93,35 @@ struct ContentView: View {
             
             // Bottom controls
             VStack(spacing: 8) {
-                // Show recognized text input area when listening
-                if speechManager.isListening && !currentRecognizingText.isEmpty {
+                // Show recognized text input area when:
+                // 1. Listening during playback (even if no text yet)
+                // 2. We have recognized text (even if not listening)
+                // This ensures it stays visible after interruption
+                if speechManager.isListeningDuringPlayback || !currentRecognizingText.isEmpty {
                     HStack {
-                        Text(currentRecognizingText)
-                            .font(.body)
-                            .foregroundColor(.secondary)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .background(Color.gray.opacity(0.1))
-                            .cornerRadius(20)
+                        if currentRecognizingText.isEmpty && speechManager.isListeningDuringPlayback {
+                            // Show placeholder when listening but no text yet
+                            Text("Listening...")
+                                .font(.body)
+                                .foregroundColor(.secondary.opacity(0.6))
+                                .italic()
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(Color.gray.opacity(0.1))
+                                .cornerRadius(20)
+                        } else if !currentRecognizingText.isEmpty {
+                            // Show recognized text (keep visible even after interruption)
+                            Text(currentRecognizingText)
+                                .font(.body)
+                                .foregroundColor(.secondary)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(Color.gray.opacity(0.1))
+                                .cornerRadius(20)
+                        }
                         Spacer()
-                        if !speechManager.isListeningDuringPlayback {
+                        // Show send button when we have text (even if not actively listening)
+                        if !currentRecognizingText.isEmpty {
                             Button(action: {
                                 sendCurrentText()
                             }) {
@@ -117,6 +134,7 @@ struct ContentView: View {
                         }
                     }
                     .padding(.horizontal)
+                    .transition(.opacity) // Smooth transition when appearing
                 }
                 
                 // Control buttons
@@ -169,33 +187,28 @@ struct ContentView: View {
             speechManager.onInterruptDetected = { [weak speechManager, weak apiService] interruptedText in
                 guard let speechManager = speechManager, let apiService = apiService else { return }
                 
-                print("🛑 Interruption detected, stopping TTS and processing: \(interruptedText.prefix(50))...")
+                print("🛑 Interruption detected, stopping TTS only (keeping recognition active): \(interruptedText.prefix(50))...")
                 
-                // Stop speaking immediately (this is critical)
+                // Stop speaking immediately (but don't send automatically)
+                // Keep recognition running so user can continue speaking
                 apiService.stopSpeaking()
                 
-                // Wait a moment for TTS to fully stop
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    // Extract command from interrupted text (remove wake word if present)
-                    let lowercasedText = interruptedText.lowercased()
-                    let wakeWordVariations = ["hello", "hallo", "halo"]
-                    
-                    var command = interruptedText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    for variation in wakeWordVariations {
-                        if let range = lowercasedText.range(of: variation) {
-                            command = String(interruptedText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                            break
-                        }
-                    }
-                    
-                    if !command.isEmpty {
-                        print("📤 Sending interrupted command: \(command.prefix(50))...")
-                        // Send as interruption with conversation history
-                        apiService.sendCommand(command, isInterruption: true)
-                    } else {
-                        print("⚠️ Interrupted text is empty after processing")
+                // IMPORTANT: Don't stop listening - recognition should continue
+                // Don't clear recognizedText - keep it visible in input field
+                // Don't change isListeningDuringPlayback - keep the state
+                // The recognized text will keep updating in the input field
+                // User can manually send using the send button when ready
+                
+                // Ensure recognition is still active
+                if !speechManager.isListening {
+                    print("⚠️ Recognition stopped unexpectedly - restarting...")
+                    // Restart recognition if it stopped
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        speechManager.startListening(duringPlayback: true)
                     }
                 }
+                
+                print("✅ TTS stopped. Recognition continues. User can send manually using the send button.")
             }
         }
         .onChange(of: speechManager.recognizedText) { newText in
@@ -219,29 +232,48 @@ struct ContentView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("SpeechStarted"))) { notification in
-            // Start listening for interruptions when speech starts
-            // Wait a bit longer to ensure TTS audio session is fully set up
-            // Also wait to avoid picking up initial TTS audio as feedback
+            // Start listening for interruptions immediately when speech starts
+            // No delay - start recognition right away to catch all words
             if !speechManager.isListening {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                    speechManager.startListening(duringPlayback: true)
-                }
+                // Start immediately, no delay
+                speechManager.startListening(duringPlayback: true)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("SpeechFinished"))) { _ in
-            // Stop listening during playback mode
-            speechManager.stopListening()
-            
-            // Clear previous response and recognized text
-            speechManager.recognizedText = ""
-            apiService.lastResponse = nil
-            apiService.lastSentCommand = nil
-            apiService.errorMessage = nil
-            
-            // Auto-start listening after speech finishes
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                if !speechManager.isListening {
-                    speechManager.startListening()
+            // Only handle SpeechFinished if TTS finished naturally (not interrupted)
+            // If user interrupted, we don't want to clear the input field or stop recognition
+            // Check if we're still in playback mode - if so, user might have interrupted
+            if speechManager.isListeningDuringPlayback {
+                // Still in playback mode - this means TTS finished naturally (not interrupted)
+                // Stop listening and clear for next cycle
+                speechManager.stopListening()
+                
+                // Clear previous response and recognized text
+                speechManager.recognizedText = ""
+                currentRecognizingText = ""
+                apiService.lastResponse = nil
+                apiService.lastSentCommand = nil
+                apiService.errorMessage = nil
+                
+                // Auto-start listening after speech finishes
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    if !speechManager.isListening {
+                        speechManager.startListening()
+                    }
+                }
+            } else {
+                // Not in playback mode - normal listening mode
+                speechManager.recognizedText = ""
+                currentRecognizingText = ""
+                apiService.lastResponse = nil
+                apiService.lastSentCommand = nil
+                apiService.errorMessage = nil
+                
+                // Auto-start listening after speech finishes
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    if !speechManager.isListening {
+                        speechManager.startListening()
+                    }
                 }
             }
         }
@@ -265,6 +297,11 @@ struct ContentView: View {
     private func sendCurrentText() {
         let textToSend = currentRecognizingText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !textToSend.isEmpty {
+            // Stop TTS if playing
+            if apiService.isSpeaking {
+                apiService.stopSpeaking()
+            }
+            
             // Stop listening before sending
             speechManager.stopListening()
             
@@ -288,7 +325,9 @@ struct ContentView: View {
             }
             
             if !command.isEmpty {
-                apiService.sendCommand(command)
+                // Check if this is during playback (interruption) or normal send
+                let isInterruption = apiService.isSpeaking || speechManager.isListeningDuringPlayback
+                apiService.sendCommand(command, isInterruption: isInterruption)
             }
             
             currentRecognizingText = ""

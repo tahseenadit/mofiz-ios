@@ -55,6 +55,7 @@ class APIService: ObservableObject {
     // Text-to-speech synthesizer
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var speechDelegate: SpeechDelegate?
+    private var isInterrupting = false // Track if we're interrupting
     
     // Database service
     private let databaseService: DatabaseService
@@ -324,14 +325,24 @@ class APIService: ObservableObject {
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0
         
+        // Reset interruption flag when starting new speech
+        isInterrupting = false
+        
         // Set delegate to track when speaking finishes
         speechDelegate = SpeechDelegate { [weak self] finished in
             DispatchQueue.main.async {
                 self?.isSpeaking = false
                 if finished {
                     print("✅ Finished speaking response")
-                    // Notify that speech finished
-                    NotificationCenter.default.post(name: NSNotification.Name("SpeechFinished"), object: nil)
+                    // Only notify if we actually finished naturally (not interrupted)
+                    if !(self?.isInterrupting ?? false) {
+                        // Speech finished naturally - notify
+                        NotificationCenter.default.post(name: NSNotification.Name("SpeechFinished"), object: nil)
+                    } else {
+                        // Speech was interrupted - don't notify
+                        print("🔇 Speech was interrupted - not posting SpeechFinished")
+                        self?.isInterrupting = false // Reset flag
+                    }
                 }
             }
         }
@@ -353,12 +364,18 @@ class APIService: ObservableObject {
     
     func stopSpeaking() {
         if speechSynthesizer.isSpeaking {
+            // Mark that we're interrupting
+            isInterrupting = true
+            
+            // Stop speaking
             speechSynthesizer.stopSpeaking(at: .immediate)
             isSpeaking = false
             
             // Don't deactivate audio session - speech recognition might be using it
             // The session will be managed by SpeechRecognitionManager
-            print("🔇 Stopped speaking - audio session remains active for recording")
+            // Don't post SpeechFinished notification - we want recognition to continue
+            print("🔇 Stopped speaking (interrupted) - audio session remains active for recording")
+            print("🔇 Recognition should continue - not posting SpeechFinished notification")
         }
     }
     

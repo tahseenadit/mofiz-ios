@@ -24,7 +24,7 @@ class SpeechRecognitionManager: NSObject, ObservableObject {
     
     // Interruption detection state
     private var lastInterruptionAttempt: Date?
-    private var interruptionDebounceInterval: TimeInterval = 1.0 // Minimum 1 second between interruptions
+    private var interruptionDebounceInterval: TimeInterval = 0.5 // Increased to prevent rapid false triggers
     private var ttsStartTime: Date? // Track when TTS started to prevent immediate false triggers
     
     var onCommandRecognized: ((String) -> Void)?
@@ -174,7 +174,7 @@ class SpeechRecognitionManager: NSObject, ObservableObject {
                 // Reset TTS start time when we start listening during playback
                 // This helps prevent false triggers from initial TTS audio
                 ttsStartTime = Date()
-                print("✅ Started listening for interruptions during playback")
+                print("✅ Started listening for interruptions during playback (continuous recognition)")
             } else {
                 statusMessage = "Listening... Say 'Hello' followed by your command, then tap Send."
                 print("✅ Started listening normally")
@@ -217,67 +217,102 @@ class SpeechRecognitionManager: NSObject, ObservableObject {
                         
                         // If listening during playback and user says something, interrupt immediately
                         // Use stricter filtering to prevent false positives from TTS feedback
+                        if self.isListeningDuringPlayback {
+                            // Debug: log all recognition results during playback
+                            if !fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                print("🎤 Recognition during playback: '\(fullText.prefix(30))...' (final: \(result.isFinal))")
+                            }
+                        }
+                        
                         if self.isListeningDuringPlayback && !fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             let trimmedText = fullText.trimmingCharacters(in: .whitespacesAndNewlines)
                             
-                            // Filter out common noise/feedback patterns
+                            // Filter out common noise/feedback patterns and TTS-like patterns
                             let lowercasedText = trimmedText.lowercased()
                             let noisePatterns = ["uh", "um", "ah", "eh", "oh", "hmm", "huh", "the", "a", "an", "is", "are", "was", "were"]
                             
-                            // Check if text is just noise
+                            // Check if text is just noise (more lenient - only single noise words)
                             let words = lowercasedText.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
-                            let isLikelyNoise = words.count <= 2 && words.allSatisfy { noisePatterns.contains($0) }
+                            // Only consider it noise if it's a single noise word
+                            let isLikelyNoise = words.count == 1 && words.allSatisfy { noisePatterns.contains($0) }
+                            
+                            // Additional check: if text is very short and matches common TTS patterns
+                            // TTS often gets recognized as single words or very short phrases
+                            let isVeryShort = trimmedText.count < 8 && words.count <= 2
+                            let isLikelyTTSFeedback = isVeryShort && words.allSatisfy { word in
+                                // Common words that TTS might be recognized as
+                                noisePatterns.contains(word) || word.count <= 3
+                            }
                             
                             // Debounce: prevent rapid false triggers
                             let now = Date()
                             if let lastAttempt = self.lastInterruptionAttempt {
                                 let timeSinceLastAttempt = now.timeIntervalSince(lastAttempt)
-                                if timeSinceLastAttempt < self.interruptionDebounceInterval {
+                                if timeSinceLastAttempt < 0.5 { // Increased to 0.5s to prevent rapid false triggers
                                     print("⏸️ Interruption debounced (last attempt \(String(format: "%.2f", timeSinceLastAttempt))s ago)")
                                     return // Skip this interruption attempt
                                 }
                             }
                             
-                            // Prevent interruptions too soon after TTS starts (likely feedback)
+                            // Prevent interruptions too soon after TTS starts (longer delay to avoid TTS feedback)
                             if let ttsStart = self.ttsStartTime {
                                 let timeSinceTTSStart = now.timeIntervalSince(ttsStart)
-                                if timeSinceTTSStart < 0.5 { // Wait at least 0.5 seconds after TTS starts
-                                    print("⏸️ Too soon after TTS start (\(String(format: "%.2f", timeSinceTTSStart))s), ignoring potential feedback")
+                                if timeSinceTTSStart < 1.0 { // Increased to 1.0s to avoid TTS feedback
+                                    print("⏸️ Too soon after TTS start (\(String(format: "%.2f", timeSinceTTSStart))s), ignoring potential TTS feedback")
                                     return
                                 }
                             }
                             
-                            // Stricter requirements for interruption:
-                            // 1. Must be a final result (not partial) to reduce false positives
-                            // 2. Must have at least 5 characters (more than just noise)
-                            // 3. Must not be just noise patterns
-                            // 4. Must have at least 2 words for better confidence
-                            let hasMinimumLength = trimmedText.count >= 5
+                            // Requirements for interruption (stricter thresholds to avoid TTS feedback):
+                            // Need at least 2 words with 8+ chars total OR 1 word with 7+ chars
+                            // Must not be just noise patterns or TTS feedback
+                            let hasMinimumLength = trimmedText.count >= 7 // Increased from 5 to 7
+                            let hasAtLeastOneWord = words.count >= 1
                             let hasMultipleWords = words.count >= 2
-                            let isNotNoise = !isLikelyNoise
-                            let isFinalResult = result.isFinal
+                            let hasMultipleWordsWithLength = hasMultipleWords && trimmedText.count >= 8
+                            let isNotNoise = !isLikelyNoise && !isLikelyTTSFeedback
                             
-                            let shouldInterrupt = isFinalResult && hasMinimumLength && hasMultipleWords && isNotNoise
+                            // Interrupt if: (2+ words with 8+ chars) OR (1 word with 7+ chars and not noise/TTS)
+                            // This prevents false triggers from TTS feedback and single short words
+                            let shouldInterrupt = (hasMultipleWordsWithLength || (hasMinimumLength && hasAtLeastOneWord)) && isNotNoise
                             
                             if shouldInterrupt {
-                                // User is speaking during playback - trigger interruption
-                                print("🔊 User interrupted during playback: \(trimmedText.prefix(50))...")
-                                print("🔊 Result is final: \(result.isFinal), Words: \(words.count), Length: \(trimmedText.count)")
+                                // User is speaking during playback - but only stop if we have visible text
+                                // The recognizedText is set at the start of this block, so it should be visible
+                                // But we want to ensure it's meaningful (not just empty or whitespace)
+                                // Since we already updated recognizedText = fullText above, it should be visible
                                 
-                                // Update last interruption attempt
-                                self.lastInterruptionAttempt = now
+                                // Double-check that the text we're about to use for interruption is actually visible
+                                // This ensures the UI has had a chance to display it
+                                let currentVisibleText = self.recognizedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                let hasVisibleText = !currentVisibleText.isEmpty && currentVisibleText.count >= 3
                                 
-                                // Cancel recognition task to stop processing
-                                self.recognitionTask?.cancel()
-                                self.recognitionTask = nil
-                                // End audio on recognition request
-                                self.recognitionRequest?.endAudio()
-                                self.recognitionRequest = nil
-                                // Mark as not listening (but keep session active)
-                                self.isListening = false
-                                // Trigger interruption callback (this will stop TTS)
-                                self.onInterruptDetected?(trimmedText)
-                                return // Don't check for wake word during interruption
+                                if hasVisibleText {
+                                    // We have visible text in the input field - safe to stop playback
+                                    print("🔊 User interrupted during playback: \(trimmedText.prefix(50))...")
+                                    print("🔊 Result is final: \(result.isFinal), Words: \(words.count), Length: \(trimmedText.count)")
+                                    print("🔊 Recognized text is visible in input field (\(currentVisibleText.count) chars) - stopping playback")
+                                    
+                                    // Update last interruption attempt
+                                    self.lastInterruptionAttempt = now
+                                    
+                                    // Stop TTS immediately but KEEP recognition running
+                                    // Don't cancel recognition task - let user continue speaking
+                                    // Don't end audio on recognition request - keep listening
+                                    // Don't mark as not listening - keep the recognition active
+                                    // Don't clear isListeningDuringPlayback - we want to keep the state
+                                    
+                                    // Just trigger interruption callback to stop TTS
+                                    // Recognition will continue and update recognizedText
+                                    self.onInterruptDetected?(trimmedText)
+                                    
+                                    // Continue processing - don't return, let recognition keep going
+                                    // This allows the user to continue speaking and see the text update
+                                    // The recognizedText will keep updating as user speaks
+                                } else {
+                                    // Text not yet visible or too short - wait for it to appear first
+                                    print("⏸️ Interruption detected but text not yet visible (\(currentVisibleText.count) chars) - waiting for recognition to populate input field")
+                                }
                             }
                             // Note: We don't log filtered interruptions to avoid console spam
                             // Only log actual interruptions above
